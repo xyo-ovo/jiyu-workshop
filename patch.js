@@ -1,8 +1,8 @@
 /* ============================================================
    patch.js —— 所有补丁合并版
-   v79：① 代码块支持变长围栏（防反引号嵌套切断）
-        ② 聊天里的文件卡片加「下载」按钮
-        ③ 告诉 AI 含反引号时用四反引号包裹
+   v80：用户发的文件是酒馆正则时 → 告诉 AI 这是什么、怎么改
+        + 保留变长围栏（四个反引号能包住三个）
+        + 保留文件卡片下载按钮
    ============================================================ */
 
 /* ============================================================
@@ -134,7 +134,7 @@
 
     '#card-list .empty,#tool-list .empty,#lore-list .empty,#provider-list .empty,#file-list .empty{padding:22px 14px !important;border:1px dashed var(--line2);border-radius:16px;font-size:12.5px;line-height:1.8;opacity:.72}',
 
-    /* 文件卡片 · 下载按钮（v79） */
+    /* 文件卡片 · 下载按钮 */
     '.file-card .fc-dl{flex:0 0 auto;width:32px;height:32px;border-radius:11px;display:grid;place-items:center;color:var(--fg3);border:1px solid var(--line2);background:var(--bg2);transition:color .16s ease,border-color .16s ease,background-color .16s ease,transform .12s ease}',
     '.file-card .fc-dl:hover{color:var(--acc);border-color:var(--acc)}',
     '.file-card .fc-dl:active{transform:scale(.86)}',
@@ -2540,7 +2540,7 @@
 })();
 
 /* ============================================================
-   22. 聊天里的文件卡片 → 加「下载」按钮（v79）
+   22. 聊天里的文件卡片 → 加「下载」按钮
    ============================================================ */
 (function fileDownloadBtn() {
   'use strict';
@@ -2623,7 +2623,7 @@
 })();
 
 /* ============================================================
-   23. 代码块解析 → 支持变长围栏（v79）
+   23. 代码块解析 → 支持变长围栏
    —— 三个反引号包不住的，可以用四个、五个
    ============================================================ */
 (function fenceParser() {
@@ -2665,38 +2665,89 @@
 })();
 
 /* ============================================================
-   24. 提示 AI：含反引号时用更长的围栏（v79）
+   24. 酒馆正则识别
+   —— 用户发的文件是酒馆正则时，告诉 AI 这是什么、怎么改
    ============================================================ */
-(function fenceHint() {
+(function sbRegexAware() {
   'use strict';
-  if (typeof buildSystemPrompt !== 'function') return;
+  if (typeof buildUserContent !== 'function' || buildUserContent.__sbrPatched) return;
 
-  var MARK = '【输出里含反引号时】';
-  var NOTE = [
-    '',
+  var MARK = '【这是一个酒馆（SillyTavern）正则脚本】';
+
+  function isSBRegex(text) {
+    try {
+      var s = String(text || '').trim();
+      if (!s) return false;
+      var c = s.charAt(0);
+      if (c !== '{' && c !== '[') return false;
+      var j = JSON.parse(s);
+      if (Array.isArray(j)) {
+        if (!j.length) return false;
+        j = j[0];
+      }
+      if (!j || typeof j !== 'object') return false;
+      if (typeof j.findRegex === 'string' && typeof j.replaceString === 'string') return true;
+      if (typeof j.scriptName === 'string' &&
+          (typeof j.findRegex === 'string' || typeof j.replaceString === 'string')) return true;
+      return false;
+    } catch (e) { return false; }
+  }
+  window.__isSBRegex = isSBRegex;
+
+  var HINT = [
     '',
     MARK,
-    '如果你的输出**本身要包含三个反引号**（```）——比如写一段含 Markdown 代码块的文本、一个把 HTML 塞进字符串里的正则脚本（replaceString 那种），或者任何嵌了 ``` 的内容——**外层必须改用四个反引号（````）包起来**，否则会被截断成好几块，用户拿到的东西是坏的。',
+    '上面那个文件是 SillyTavern（酒馆）格式的正则脚本。字段含义：',
+    '· scriptName —— 脚本名，随便叫',
+    '· findRegex —— 要匹配的正则，写法是 "/正则/标志位"，例如 "/<branches>[\\s\\S]*?<\\/branches>/gi"',
+    '· replaceString —— 替换成什么。可以用 $1 $2 引用捕获组，也可以是一整段 HTML / 文本',
+    '· trimStrings —— 替换前先从匹配结果里去掉的字符串（数组）',
+    '· placement —— 作用位置：1=用户输入，2=AI 输出，3=斜杠命令，4=提示词，5=推理内容',
+    '· disabled —— true 表示停用',
+    '· markdownOnly —— 只在显示时替换，不改原文',
+    '· promptOnly —— 只在发给 AI 时替换',
+    '· runOnEdit —— 编辑消息时也执行',
+    '· substituteRegex —— 0=不递归，1=替换结果再跑一遍，2=……',
+    '· minDepth / maxDepth —— 作用的消息楼层范围',
     '',
-    '规则：',
-    '1. 内容里没有三个反引号 → 正常用 ``` 就行。',
-    '2. 内容里有三个反引号 → 外层改用 ```` （4 个）。内容里有 4 个 → 用 5 个，以此类推。',
-    '3. 开头用了几个，结尾必须用**同样个数**。',
-    '4. 例子（下面是正确写法，外层 4 个反引号）：',
-    '````',
-    '这里可以安全出现 ``` 这样的三反引号',
-    '````',
+    '用户要你改正则时，按下面来：',
+    '1. 输出**完整的** JSON，不要省略、不要用 "..." 占位。',
+    '2. 保持同样的字段结构，不要丢字段。',
+    '3. **用 ```json 代码块包起来** —— 这个界面会把它变成一张 .json 文件卡片，用户可以点开、直接下载。',
+    '4. **如果 replaceString 里本身就含有三个反引号（```），外层代码块必须改用四个反引号（````）包**，否则内容会被截断成好几块，用户拿到的文件是坏的。',
+    '5. 改了什么，在 JSON 外面简短说两句就行，不要长篇大论。',
   ].join('\n');
 
-  var _orig = buildSystemPrompt;
-  var _new = function () {
-    var s = _orig();
-    if (typeof s !== 'string') return s;
-    if (s.indexOf(MARK) >= 0) return s;
-    return s + NOTE;
+  var _prev = buildUserContent;
+  var _new = function (m) {
+    var r = _prev(m);
+    try {
+      if (!m || !Array.isArray(m.attachments)) return r;
+      var hit = false;
+      for (var i = 0; i < m.attachments.length; i++) {
+        var a = m.attachments[i];
+        if (a && a.kind === 'text' && a.text && isSBRegex(a.text)) { hit = true; break; }
+      }
+      if (!hit) return r;
+
+      if (typeof r === 'string') return r + '\n\n' + HINT;
+
+      if (Array.isArray(r)) {
+        var last = -1;
+        for (var j = r.length - 1; j >= 0; j--) {
+          if (r[j] && r[j].type === 'text') { last = j; break; }
+        }
+        if (last >= 0) r[last].text = (r[last].text || '') + '\n\n' + HINT;
+        else r.push({ type: 'text', text: HINT });
+        return r;
+      }
+    } catch (e) {}
+    return r;
   };
-  try { buildSystemPrompt = _new; } catch (e) {}
-  try { window.buildSystemPrompt = _new; } catch (e) {}
+  _new.__sbrPatched = true;
+
+  try { buildUserContent = _new; } catch (e) {}
+  try { window.buildUserContent = _new; } catch (e) {}
 })();
 
 /* ============================================================
@@ -2707,7 +2758,7 @@
     try {
       var el = document.querySelector('.ver');
       if (!el) return;
-      el.textContent = 'v79';
+      el.textContent = 'v80';
     } catch (e) {}
   }
   set();
