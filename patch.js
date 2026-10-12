@@ -1,6 +1,8 @@
 /* ============================================================
    patch.js —— 所有补丁合并版
-   v78：AI 自动按 YAML 写「User 人设」（按需注入，不常驻）
+   v79：① 代码块支持变长围栏（防反引号嵌套切断）
+        ② 聊天里的文件卡片加「下载」按钮
+        ③ 告诉 AI 含反引号时用四反引号包裹
    ============================================================ */
 
 /* ============================================================
@@ -131,6 +133,12 @@
     '#file-list .file-row:hover .fr-btns{opacity:1}',
 
     '#card-list .empty,#tool-list .empty,#lore-list .empty,#provider-list .empty,#file-list .empty{padding:22px 14px !important;border:1px dashed var(--line2);border-radius:16px;font-size:12.5px;line-height:1.8;opacity:.72}',
+
+    /* 文件卡片 · 下载按钮（v79） */
+    '.file-card .fc-dl{flex:0 0 auto;width:32px;height:32px;border-radius:11px;display:grid;place-items:center;color:var(--fg3);border:1px solid var(--line2);background:var(--bg2);transition:color .16s ease,border-color .16s ease,background-color .16s ease,transform .12s ease}',
+    '.file-card .fc-dl:hover{color:var(--acc);border-color:var(--acc)}',
+    '.file-card .fc-dl:active{transform:scale(.86)}',
+    '.file-card .fc-dl .ic{width:15px;height:15px}',
 
     '#topbar{position:fixed !important;top:0;left:0;right:0;z-index:40;',
     '  background:color-mix(in srgb,var(--bg) 62%,transparent) !important;',
@@ -2322,7 +2330,6 @@
 
 /* ============================================================
    21. User 人设 · YAML 输出规范（按需注入）
-   —— 用户提到「人设 / persona / 我的设定」等词时才挂上
    ============================================================ */
 (function userPersonaSpec() {
   'use strict';
@@ -2533,14 +2540,174 @@
 })();
 
 /* ============================================================
-   22. 版本徽章
+   22. 聊天里的文件卡片 → 加「下载」按钮（v79）
+   ============================================================ */
+(function fileDownloadBtn() {
+  'use strict';
+  if (typeof fileEl !== 'function' || fileEl.__dlPatched) return;
+
+  function say(msg, ms) {
+    try { if (typeof toast === 'function') toast(msg, ms || 2600); } catch (e) {}
+  }
+
+  async function doDownload(p) {
+    var f = null;
+    try { f = await dbGet(p.fileId); } catch (e) {}
+    if (!f) { say('文件内容找不到了'); return; }
+
+    var name = f.name || 'file.txt';
+    var code = f.code || '';
+
+    if (/^data:/i.test(code)) {
+      var a0 = document.createElement('a');
+      a0.href = code;
+      a0.download = name;
+      document.body.appendChild(a0); a0.click(); a0.remove();
+      say('已下载 ' + name, 2600);
+      return;
+    }
+
+    var low = name.toLowerCase();
+    var mime = 'text/plain';
+    if (low.slice(-5) === '.html' || low.slice(-4) === '.htm') mime = 'text/html';
+    else if (low.slice(-4) === '.svg') mime = 'image/svg+xml';
+    else if (low.slice(-5) === '.json') mime = 'application/json';
+    else if (low.slice(-4) === '.css') mime = 'text/css';
+    else if (low.slice(-3) === '.js') mime = 'text/javascript';
+    else if (low.slice(-3) === '.md') mime = 'text/markdown';
+    else if (low.slice(-4) === '.csv') mime = 'text/csv';
+    else if (low.slice(-5) === '.yaml' || low.slice(-4) === '.yml') mime = 'text/yaml';
+    else if (low.slice(-4) === '.xml') mime = 'application/xml';
+
+    try {
+      var b = new Blob([code], { type: mime + ';charset=utf-8' });
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(b);
+      a.download = name;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(function () { URL.revokeObjectURL(a.href); }, 1500);
+      say('已下载 ' + name, 2600);
+    } catch (e) {
+      say('下载失败：' + ((e && e.message) || e), 3600);
+    }
+  }
+
+  var _prev = fileEl;
+  var _new = function (p) {
+    var d = _prev(p);
+    try {
+      if (!d || !p) return d;
+      if (d.querySelector('.fc-dl')) return d;
+
+      var b = document.createElement('button');
+      b.className = 'fc-dl';
+      b.title = '下载这个文件';
+      b.innerHTML = '<svg class="ic"><use href="#i-download"/></svg>';
+      b.onclick = function (e) {
+        e.stopPropagation();
+        e.preventDefault();
+        doDownload(p);
+      };
+
+      var save = d.querySelector('.fc-save');
+      var open = d.querySelector('.fc-open');
+      if (save && save.parentNode) save.parentNode.insertBefore(b, save);
+      else if (open && open.parentNode) open.parentNode.insertBefore(b, open);
+      else d.appendChild(b);
+    } catch (e) {}
+    return d;
+  };
+  _new.__dlPatched = true;
+  try { fileEl = _new; } catch (e) {}
+  try { window.fileEl = _new; } catch (e) {}
+})();
+
+/* ============================================================
+   23. 代码块解析 → 支持变长围栏（v79）
+   —— 三个反引号包不住的，可以用四个、五个
+   ============================================================ */
+(function fenceParser() {
+  'use strict';
+  if (typeof parseSegments !== 'function' || parseSegments.__fencePatched) return;
+
+  function parse(content) {
+    var segs = [];
+    if (typeof content !== 'string') return segs;
+
+    var re = /(`{3,})([A-Za-z0-9_+-]*)[ \t]*\r?\n?([\s\S]*?)(\1|$)/g;
+    var last = 0;
+    var m;
+
+    while ((m = re.exec(content))) {
+      if (m.index > last) {
+        segs.push({ type: 'text', text: content.slice(last, m.index) });
+      }
+      var fence = m[1];
+      var lang = (m[2] || '').toLowerCase();
+      var code = m[3] || '';
+      var closed = m[4] === fence;
+
+      if (closed && code.slice(-1) === '\n') code = code.slice(0, -1);
+
+      segs.push({ type: 'code', lang: lang, code: code, closed: closed });
+      last = re.lastIndex;
+      if (!closed) break;
+    }
+    if (last < content.length) {
+      segs.push({ type: 'text', text: content.slice(last) });
+    }
+    return segs;
+  }
+
+  parse.__fencePatched = true;
+  try { parseSegments = parse; } catch (e) {}
+  try { window.parseSegments = parse; } catch (e) {}
+})();
+
+/* ============================================================
+   24. 提示 AI：含反引号时用更长的围栏（v79）
+   ============================================================ */
+(function fenceHint() {
+  'use strict';
+  if (typeof buildSystemPrompt !== 'function') return;
+
+  var MARK = '【输出里含反引号时】';
+  var NOTE = [
+    '',
+    '',
+    MARK,
+    '如果你的输出**本身要包含三个反引号**（```）——比如写一段含 Markdown 代码块的文本、一个把 HTML 塞进字符串里的正则脚本（replaceString 那种），或者任何嵌了 ``` 的内容——**外层必须改用四个反引号（````）包起来**，否则会被截断成好几块，用户拿到的东西是坏的。',
+    '',
+    '规则：',
+    '1. 内容里没有三个反引号 → 正常用 ``` 就行。',
+    '2. 内容里有三个反引号 → 外层改用 ```` （4 个）。内容里有 4 个 → 用 5 个，以此类推。',
+    '3. 开头用了几个，结尾必须用**同样个数**。',
+    '4. 例子（下面是正确写法，外层 4 个反引号）：',
+    '````',
+    '这里可以安全出现 ``` 这样的三反引号',
+    '````',
+  ].join('\n');
+
+  var _orig = buildSystemPrompt;
+  var _new = function () {
+    var s = _orig();
+    if (typeof s !== 'string') return s;
+    if (s.indexOf(MARK) >= 0) return s;
+    return s + NOTE;
+  };
+  try { buildSystemPrompt = _new; } catch (e) {}
+  try { window.buildSystemPrompt = _new; } catch (e) {}
+})();
+
+/* ============================================================
+   25. 版本徽章
    ============================================================ */
 (function bumpVer() {
   function set() {
     try {
       var el = document.querySelector('.ver');
       if (!el) return;
-      el.textContent = 'v78';
+      el.textContent = 'v79';
     } catch (e) {}
   }
   set();
